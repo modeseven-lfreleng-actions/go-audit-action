@@ -1,6 +1,6 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Action test/validation workflow
 name: "Test GitHub Action 🧪"
@@ -20,26 +20,26 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  ### Test audits against the synthetic Go fixture ###
+  test-synthetic:
+    name: "Test: synthetic fixture (test-go-project)"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 20
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
       # Harden the runner with the just-loaded allow-list.
-      - name: 'Harden runner (block)'
+      - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -50,41 +50,421 @@ jobs:
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
+      - name: "Checkout test project: lfreleng-actions/test-go-project"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: lfreleng-actions/test-go-project
+          ref: a77c5ec773edc266ddcc3c1d1c306e7bb3f12c30
+          path: test-project
+          persist-credentials: false
+
+      # The pinned fixture commit imports pkg/calculator, but the
+      # package never made it into the tree (masked by a .gitignore
+      # entry). Restore a minimal implementation so the audit tools
+      # can load and analyse the module; drop this step once the
+      # fixture repo gains the package upstream.
+      - name: "Restore missing fixture package"
         shell: bash
         run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Restore missing fixture package
+          mkdir -p test-project/pkg/calculator
+          cat > test-project/pkg/calculator/calculator.go << 'EOF'
+          // SPDX-License-Identifier: Apache-2.0
+          // SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-      - name: "Running local action: ${{ github.repository }}"
+          package calculator
+
+          import "errors"
+
+          type Calculator struct{}
+
+          func New() *Calculator { return &Calculator{} }
+
+          func (c *Calculator) Add(a, b float64) float64 { return a + b }
+
+          func (c *Calculator) Subtract(a, b float64) float64 {
+              return a - b
+          }
+
+          func (c *Calculator) Multiply(a, b float64) float64 {
+              return a * b
+          }
+
+          func (c *Calculator) Divide(a, b float64) (float64, error) {
+              if b == 0 {
+                  return 0, errors.New("division by zero")
+              }
+              return a / b, nil
+          }
+          EOF
+          echo "Fixture package restored ✅"
+
+      # Raise the fixture's go directive (go 1.21) so the
+      # go_version_file run below selects a toolchain able to build
+      # the pinned audit tools through the version-file path (the
+      # golang.org/x/vuln v1.5.0 go.mod declares go 1.25.0)
+      - name: "Set modern Go directive in fixture go.mod"
+        shell: bash
+        run: |
+          # Set modern Go directive in fixture go.mod
+          sed -i 's/^go .*/go 1.25.11/' test-project/go.mod
+          echo "Fixture go directive updated ✅"
+
+      # gosec and staticcheck analyse committed source only, so their
+      # verdicts stay deterministic for a pinned fixture and pinned
+      # tool versions: the clean fixture must pass both
+      - name: "Running local action: static analysis tools"
+        id: static-audit
         uses: ./
         with:
-          input: "test input 💬"
+          path_prefix: test-project
+          go_version: '1.25.11'
+          govulncheck: 'false'
+          gosec: 'true'
+          staticcheck: 'true'
+          output_directory: audit-reports
 
-      - name: "Validated local action: ${{ github.repository }}"
+      # govulncheck verdicts move with the vulnerability database
+      # and the toolchain patch level, so this run stays
+      # non-blocking and verifies reporting mechanics instead of
+      # asserting a fixed verdict
+      - name: "Running local action: govulncheck reporting"
+        id: vuln-audit
+        uses: ./
+        with:
+          path_prefix: test-project
+          go_version: '1.25.11'
+          permit_fail: 'true'
+          output_directory: vuln-reports
+
+      # Exercises the go_version_file branch: with go_version
+      # omitted, the action validates and resolves go.mod under
+      # path_prefix and wires it through to actions/setup-go via
+      # the go-version-file input
+      - name: "Running local action: version from go_version_file"
+        id: version-file-audit
+        uses: ./
+        with:
+          path_prefix: test-project
+          govulncheck: 'false'
+          gosec: 'true'
+          staticcheck: 'false'
+          output_directory: version-file-reports
+
+      - name: "Verify audit outputs"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          STATIC_GOSEC: ${{ steps.static-audit.outputs.gosec_passed }}
+          STATIC_STATICCHECK: >-
+            ${{ steps.static-audit.outputs.staticcheck_passed }}
+          STATIC_GOVULNCHECK: >-
+            ${{ steps.static-audit.outputs.govulncheck_passed }}
+          STATIC_REPORTS: >-
+            ${{ steps.static-audit.outputs.reports_directory }}
+          VULN_GOVULNCHECK: >-
+            ${{ steps.vuln-audit.outputs.govulncheck_passed }}
+          VULN_REPORTS: ${{ steps.vuln-audit.outputs.reports_directory }}
+          VF_GOSEC: >-
+            ${{ steps.version-file-audit.outputs.gosec_passed }}
+          VF_REPORTS: >-
+            ${{ steps.version-file-audit.outputs.reports_directory }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Verify audit outputs
+          errors=0
+          if [ "${STATIC_GOSEC}" != "true" ]; then
+            echo "Static audit: gosec_passed not true ❌"
+            errors=1
+          fi
+          if [ "${STATIC_STATICCHECK}" != "true" ]; then
+            echo "Static audit: staticcheck_passed not true ❌"
+            errors=1
+          fi
+          if [ "${STATIC_GOVULNCHECK}" != "skipped" ]; then
+            echo "Static audit: govulncheck_passed not skipped ❌"
+            errors=1
+          fi
+          case "${STATIC_REPORTS}" in
+            */audit-reports) ;;
+            *)
+              echo "Static audit: unexpected reports directory ❌"
+              errors=1 ;;
+          esac
+          if [ ! -f "${STATIC_REPORTS}/gosec.sarif" ]; then
+            echo "Static audit: gosec.sarif missing ❌"
+            errors=1
+          fi
+          if [ ! -f "${STATIC_REPORTS}/staticcheck.txt" ]; then
+            echo "Static audit: staticcheck.txt missing ❌"
+            errors=1
+          fi
+          case "${VULN_GOVULNCHECK}" in
+            true|false) ;;
+            *)
+              echo "Vuln audit: govulncheck_passed not set ❌"
+              errors=1 ;;
+          esac
+          if [ ! -f "${VULN_REPORTS}/govulncheck.txt" ]; then
+            echo "Vuln audit: govulncheck.txt missing ❌"
+            errors=1
+          fi
+          if [ ! -s "${VULN_REPORTS}/govulncheck.json" ]; then
+            echo "Vuln audit: govulncheck.json missing or empty ❌"
+            errors=1
+          fi
+          if [ "${VF_GOSEC}" != "true" ]; then
+            echo "Version-file audit: gosec_passed not true ❌"
+            errors=1
+          fi
+          if [ ! -f "${VF_REPORTS}/gosec.sarif" ]; then
+            echo "Version-file audit: gosec.sarif missing ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Audit verification failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Audit outputs verified ✅"
+          echo "Audit outputs verified ✅" >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test audits against a real Gerrit-mirrored monorepo ###
+  test-real:
+    name: "Test: real fixture (onap/multicloud-k8s)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: ./
-        id: failure
-        continue-on-error: true
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
         with:
-          invalid_input: "Some garbage"
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: "Checkout test project: onap/multicloud-k8s"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: onap/multicloud-k8s
+          ref: 5c3b1a96811024e65b0977305b6d6737a6e2d453
+          path: test-project
+          persist-credentials: false
+
+      # The module's go.mod predates the go directive conventions the
+      # current toolchain expects (go 1.16), so the runs pass an
+      # explicit modern Go version. The pinned legacy code carries
+      # known gosec and staticcheck findings, giving a deterministic
+      # failing verdict for both tools.
+      - name: "Running local action: full audit (soft fail)"
+        id: full-audit
+        uses: ./
+        with:
+          path_prefix: test-project/src/k8splugin
+          go_version: '1.25.11'
+          govulncheck: 'true'
+          gosec: 'true'
+          staticcheck: 'true'
+          permit_fail: 'true'
+          output_directory: audit-reports
+
+      - name: "Running local action: hard fail on findings"
+        id: hard-fail
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: test-project/src/k8splugin
+          go_version: '1.25.11'
+          govulncheck: 'false'
+          gosec: 'true'
+          output_directory: audit-reports-hard
+
+      - name: "Verify soft/hard failure semantics"
         shell: bash
+        env:
+          FULL_GOSEC: ${{ steps.full-audit.outputs.gosec_passed }}
+          FULL_STATICCHECK: >-
+            ${{ steps.full-audit.outputs.staticcheck_passed }}
+          FULL_GOVULNCHECK: >-
+            ${{ steps.full-audit.outputs.govulncheck_passed }}
+          FULL_REPORTS: ${{ steps.full-audit.outputs.reports_directory }}
+          HARD_OUTCOME: ${{ steps.hard-fail.outcome }}
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Verify soft/hard failure semantics
+          errors=0
+          if [ "${FULL_GOSEC}" != "false" ]; then
+            echo "Full audit: gosec_passed not false ❌"
+            errors=1
+          fi
+          if [ "${FULL_STATICCHECK}" != "false" ]; then
+            echo "Full audit: staticcheck_passed not false ❌"
+            errors=1
+          fi
+          case "${FULL_GOVULNCHECK}" in
+            true|false) ;;
+            *)
+              echo "Full audit: govulncheck_passed not set ❌"
+              errors=1 ;;
+          esac
+          for report in govulncheck.txt govulncheck.json \
+            gosec.sarif staticcheck.txt; do
+            if [ ! -f "${FULL_REPORTS}/${report}" ]; then
+              echo "Full audit: ${report} missing ❌"
+              errors=1
+            fi
+          done
+          # The pinned fixture SHA and pinned tool versions give
+          # deterministic finding counts; assert them to catch
+          # accidental changes in tool invocation or report parsing
+          gosec_count="$(jq '.runs[0].results | length' \
+            "${FULL_REPORTS}/gosec.sarif")"
+          if [ "${gosec_count}" != "38" ]; then
+            echo "Full audit: gosec findings ${gosec_count} != 38 ❌"
+            errors=1
+          fi
+          staticcheck_count="$(grep -c '' \
+            "${FULL_REPORTS}/staticcheck.txt")"
+          if [ "${staticcheck_count}" != "18" ]; then
+            echo "Full audit: staticcheck findings" \
+              "${staticcheck_count} != 18 ❌"
+            errors=1
+          fi
+          if [ "${HARD_OUTCOME}" = "success" ]; then
+            echo "Hard-fail run unexpectedly succeeded ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Failure semantics tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Soft/hard failure semantics verified ✅"
+          echo "Soft/hard failure semantics verified ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test invalid inputs fail closed ###
+  test-failures:
+    name: "Test: invalid inputs and error handling"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: "Running local action with invalid boolean"
+        id: bad-bool
+        continue-on-error: true
+        uses: ./
+        with:
+          govulncheck: 'yes'
+
+      - name: "Running local action with unpinned tool version"
+        id: bad-version
+        continue-on-error: true
+        uses: ./
+        with:
+          gosec: 'true'
+          gosec_version: 'latest'
+
+      - name: "Running local action with metacharacter version"
+        id: bad-version-chars
+        continue-on-error: true
+        uses: ./
+        with:
+          govulncheck_version: 'v1.5.0;id'
+
+      - name: "Running local action with workspace-escaping path"
+        id: escape-path
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: /etc
+
+      # go_version set explicitly: with the version-file default the
+      # validate step would fail on the missing go.mod first, and the
+      # failure would not be attributable to the output-directory
+      # boundary enforcement under test
+      - name: "Running local action with escaping output directory"
+        id: escape-output
+        continue-on-error: true
+        uses: ./
+        with:
+          go_version: '1.25.11'
+          output_directory: /opt/escape-test
+
+      - name: "Running local action with no tools enabled"
+        id: no-tools
+        continue-on-error: true
+        uses: ./
+        with:
+          govulncheck: 'false'
+          gosec: 'false'
+          staticcheck: 'false'
+
+      - name: "Verify invalid inputs were rejected"
+        shell: bash
+        env:
+          BOOL_OUTCOME: ${{ steps.bad-bool.outcome }}
+          VERSION_OUTCOME: ${{ steps.bad-version.outcome }}
+          VERSION_CHARS_OUTCOME: ${{ steps.bad-version-chars.outcome }}
+          ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
+          OUTPUT_ESCAPE_OUTCOME: ${{ steps.escape-output.outcome }}
+          NO_TOOLS_OUTCOME: ${{ steps.no-tools.outcome }}
+        run: |
+          # Failure testing is also important; all steps MUST fail
+          errors=0
+          for outcome_pair in \
+            "bool:${BOOL_OUTCOME}" \
+            "version:${VERSION_OUTCOME}" \
+            "version-chars:${VERSION_CHARS_OUTCOME}" \
+            "escape:${ESCAPE_OUTCOME}" \
+            "output-escape:${OUTPUT_ESCAPE_OUTCOME}" \
+            "no-tools:${NO_TOOLS_OUTCOME}"; do
+            test_name="${outcome_pair%%:*}"
+            outcome="${outcome_pair#*:}"
+            if [ "${outcome}" = "success" ]; then
+              echo "Invalid ${test_name} unexpectedly succeeded ❌"
+              errors=1
+            fi
+          done
+          if [ "${errors}" != "0" ]; then
+            echo "Failure-path tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Invalid inputs correctly rejected ✅"
+          echo "Invalid inputs correctly rejected ✅" \
+            >> "$GITHUB_STEP_SUMMARY"

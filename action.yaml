@@ -1,53 +1,777 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# go-audit-action
+name: "🛡️ Go Audit"
+description: "Runs govulncheck, gosec and staticcheck security audits"
+# Wraps the three standard Go audit tools behind one validated
+# interface with individually toggleable tools and pinned versions
+# (installed via go install pkg@version; never @latest). Tool
+# findings are collected by an aggregation step so every enabled
+# tool runs to completion; permit_fail supports a non-blocking mode
+# that reports findings without failing the job.
 
 inputs:
-  input:
-    description: "Description of input"
-    required: true
+  # Optional
+  go_version:
+    # yamllint disable-line rule:line-length
+    description: "Explicit Go version to install; takes precedence over go_version_file"
+    required: false
+    default: ""
+  go_version_file:
+    # yamllint disable-line rule:line-length
+    description: "File to read the Go version from, relative to path_prefix"
+    required: false
+    default: "go.mod"
+  path_prefix:
+    description: "Project directory; must resolve within the workspace"
+    required: false
+    default: "."
+  govulncheck:
+    description: "Run govulncheck: 'true' or 'false'"
+    required: false
+    default: "true"
+  gosec:
+    description: "Run gosec: 'true' or 'false'"
+    required: false
+    default: "false"
+  staticcheck:
+    description: "Run staticcheck: 'true' or 'false'"
+    required: false
+    default: "false"
+  govulncheck_version:
+    # yamllint disable-line rule:line-length
+    description: "golang.org/x/vuln version to install, e.g. v1.5.0; never 'latest'"
+    required: false
+    default: "v1.5.0"
+  gosec_version:
+    # yamllint disable-line rule:line-length
+    description: "securego/gosec version to install, e.g. v2.27.1; never 'latest'"
+    required: false
+    default: "v2.27.1"
+  staticcheck_version:
+    # yamllint disable-line rule:line-length
+    description: "honnef.co/go/tools version to install, e.g. v0.7.0; never 'latest'"
+    required: false
+    default: "v0.7.0"
+  permit_fail:
+    # yamllint disable-line rule:line-length
+    description: "Report tool findings without failing the action: 'true' or 'false'"
+    required: false
+    default: "false"
+  output_directory:
+    # yamllint disable-line rule:line-length
+    description: "Audit report directory, within workspace or runner temp"
+    required: false
+    default: "."
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  govulncheck_passed:
+    description: "govulncheck result: 'true', 'false' or 'skipped'"
+    value: ${{ steps.aggregate.outputs.govulncheck_passed }}
+  gosec_passed:
+    description: "gosec result: 'true', 'false' or 'skipped'"
+    value: ${{ steps.aggregate.outputs.gosec_passed }}
+  staticcheck_passed:
+    description: "staticcheck result: 'true', 'false' or 'skipped'"
+    value: ${{ steps.aggregate.outputs.staticcheck_passed }}
+  reports_directory:
+    description: "Absolute path to the directory holding audit reports"
+    value: ${{ steps.reports.outputs.reports_directory }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Validate inputs"
+      id: validate
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        INPUT_GO_VERSION: ${{ inputs.go_version }}
+        INPUT_GO_VERSION_FILE: ${{ inputs.go_version_file }}
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_GOVULNCHECK: ${{ inputs.govulncheck }}
+        INPUT_GOSEC: ${{ inputs.gosec }}
+        INPUT_STATICCHECK: ${{ inputs.staticcheck }}
+        INPUT_GOVULNCHECK_VERSION: ${{ inputs.govulncheck_version }}
+        INPUT_GOSEC_VERSION: ${{ inputs.gosec_version }}
+        INPUT_STATICCHECK_VERSION: ${{ inputs.staticcheck_version }}
+        INPUT_PERMIT_FAIL: ${{ inputs.permit_fail }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        # Validate inputs
+        # Preflight: fail with a clear message when required tools are
+        # missing (possible on minimal self-hosted runners). The base
+        # list covers this validate step and the report preparation;
+        # jq serves only the gosec step and tee only the
+        # govulncheck/staticcheck pipelines, so the per-tool toggles
+        # add them on demand
+        required_tools="realpath mktemp tr"
+        if [ "${INPUT_GOSEC}" = "true" ]; then
+          required_tools="${required_tools} jq"
+        fi
+        if [ "${INPUT_GOVULNCHECK}" = "true" ] ||
+          [ "${INPUT_STATICCHECK}" = "true" ]; then
+          required_tools="${required_tools} tee"
+        fi
+        for tool in ${required_tools}; do
+          if ! command -v "${tool}" > /dev/null 2>&1; then
+            echo "Error: required tool not found: ${tool} ❌"
+            printf '%s%s\n' \
+              "This run requires the following tools on the " \
+              "runner: ${required_tools}"
+            exit 1
+          fi
+        done
+        # The action requires GNU realpath -m (missing-path
+        # resolution); BSD/macOS realpath lacks it, and failing here
+        # gives a clearer error than a mid-run failure
+        if ! realpath -m -- / > /dev/null 2>&1; then
+          echo "Error: realpath does not support the -m option ❌"
+          echo "This action requires GNU coreutils realpath"
           exit 1
         fi
-
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+        # The workspace/temp boundary checks depend on these runner
+        # environment variables: an empty value would degrade the
+        # case patterns to /* and disable the escape checks
+        for dir_var in GITHUB_WORKSPACE RUNNER_TEMP; do
+          dir_value="${!dir_var:-}"
+          if [ -z "${dir_value}" ] || [ ! -d "${dir_value}" ]; then
+            echo "Error: ${dir_var} not set to a directory ❌"
+            echo "This action requires a standard runner environment"
+            exit 1
+          fi
         done
+        # A case glob validates the entire string, including embedded
+        # newlines; grep would only validate per line
+        for bool_pair in \
+          "govulncheck:${INPUT_GOVULNCHECK}" \
+          "gosec:${INPUT_GOSEC}" \
+          "staticcheck:${INPUT_STATICCHECK}" \
+          "permit_fail:${INPUT_PERMIT_FAIL}"; do
+          bool_name="${bool_pair%%:*}"
+          bool_value="${bool_pair#*:}"
+          case "${bool_value}" in
+            true|false) ;;
+            *)
+              echo "Error: ${bool_name} must be 'true' or 'false' ❌"
+              exit 1 ;;
+          esac
+        done
+        if [ "${INPUT_GOVULNCHECK}" != "true" ] && \
+          [ "${INPUT_GOSEC}" != "true" ] && \
+          [ "${INPUT_STATICCHECK}" != "true" ]; then
+          echo "Error: no audit tools enabled ❌"
+          echo "Enable govulncheck, gosec and/or staticcheck"
+          exit 1
+        fi
+        # Tool versions feed go install pkg@version, so they must
+        # look like pinned tags; a strict character set prevents
+        # command or version-query injection
+        for version_pair in \
+          "govulncheck_version:${INPUT_GOVULNCHECK_VERSION}" \
+          "gosec_version:${INPUT_GOSEC_VERSION}" \
+          "staticcheck_version:${INPUT_STATICCHECK_VERSION}"; do
+          version_name="${version_pair%%:*}"
+          version_value="${version_pair#*:}"
+          case "${version_value}" in
+            v[0-9]*) ;;
+            *)
+              echo "Error: ${version_name} must be a pinned tag ❌"
+              echo "Expected a version such as v1.2.3; never 'latest'"
+              exit 1 ;;
+          esac
+          case "${version_value}" in
+            *[!0-9A-Za-z.-]*)
+              echo "Error: invalid ${version_name} ❌"
+              echo "Allowed characters: A-Z a-z 0-9 . -"
+              exit 1 ;;
+          esac
+        done
+        if [ -n "${INPUT_GO_VERSION}" ]; then
+          case "${INPUT_GO_VERSION}" in
+            *[!0-9A-Za-z.-]*)
+              echo "Error: invalid go_version ❌"
+              echo "Allowed characters: A-Z a-z 0-9 . -"
+              exit 1 ;;
+          esac
+        fi
+        # Anchor relative paths to GITHUB_WORKSPACE: composite
+        # actions can run with a caller-set working directory, so
+        # resolving against the current directory would be
+        # non-deterministic
+        case "${INPUT_PATH_PREFIX}" in
+          /*) project_dir="${INPUT_PATH_PREFIX}" ;;
+          *) project_dir="${GITHUB_WORKSPACE}/${INPUT_PATH_PREFIX}" ;;
+        esac
+        if [ ! -d "${project_dir}" ]; then
+          echo "Error: invalid project directory ❌"
+          # Strip CR/LF before logging the untrusted path: embedded
+          # newlines could otherwise inject workflow commands via the
+          # log stream
+          printf 'Path not found: %s\n' \
+            "$(printf '%s' "${project_dir}" | tr -d '\r\n')"
+          exit 1
+        fi
+        # Restrict the audit to the workspace: an absolute or escaped
+        # path could otherwise expose runner filesystem details in
+        # the reports. Each realpath call fails closed: an empty
+        # result would degrade the boundary case patterns to /* and
+        # disable the escape checks
+        if ! resolved="$(realpath -- "${project_dir}")" ||
+          [ -z "${resolved}" ]; then
+          echo "Error: failed to resolve project directory ❌"
+          exit 1
+        fi
+        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE}")" ||
+          [ -z "${workspace}" ]; then
+          echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${resolved}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        # Emit either an explicit version or a version file path for
+        # actions/setup-go; the file path can contain characters that
+        # are unsafe for plain key=value output writes, so it uses the
+        # multiline heredoc format with a random delimiter
+        # (regenerated until provably absent from the value) to
+        # prevent output-file injection
+        emit_output() {
+          key="$1"
+          value="$2"
+          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+        if [ -n "${INPUT_GO_VERSION}" ]; then
+          echo "setup_go_version=${INPUT_GO_VERSION}" >> "$GITHUB_OUTPUT"
+        else
+          case "${INPUT_GO_VERSION_FILE}" in
+            *[!A-Za-z0-9._/-]*|''|/*)
+              echo "Error: invalid go_version_file ❌"
+              echo "Expected a relative path"
+              echo "Allowed characters: A-Z a-z 0-9 . _ / -"
+              exit 1 ;;
+          esac
+          version_file="${resolved}/${INPUT_GO_VERSION_FILE}"
+          # Canonicalize before any existence probe so traversal
+          # sequences cannot test for files outside the project
+          # directory, then re-check after resolving symlinks to
+          # block symlink escapes. Check against the resolved
+          # project directory, not the workspace: go_version_file
+          # is documented as relative to path_prefix, so values
+          # such as ../go.mod must not select a version file from
+          # outside the project directory
+          if ! vf_candidate="$(realpath -m -- "${version_file}")" ||
+            [ -z "${vf_candidate}" ]; then
+            echo "Error: failed to resolve go_version_file ❌"
+            exit 1
+          fi
+          case "${vf_candidate}/" in
+            "${resolved}/"*) ;;
+            *)
+              echo "Error: go_version_file escapes the project ❌"
+              echo "go_version_file must resolve within path_prefix"
+              exit 1 ;;
+          esac
+          if [ ! -f "${vf_candidate}" ]; then
+            echo "Error: go_version_file not found ❌"
+            printf 'Path not found: %s\n' \
+              "$(printf '%s' "${vf_candidate}" | tr -d '\r\n')"
+            exit 1
+          fi
+          if ! vf_resolved="$(realpath -- "${vf_candidate}")" ||
+            [ -z "${vf_resolved}" ]; then
+            echo "Error: failed to resolve go_version_file ❌"
+            exit 1
+          fi
+          case "${vf_resolved}/" in
+            "${resolved}/"*) ;;
+            *)
+              echo "Error: go_version_file escapes the project ❌"
+              echo "go_version_file must resolve within path_prefix"
+              exit 1 ;;
+          esac
+          emit_output "setup_go_version_file" "${vf_resolved}"
+        fi
+
+    - name: "Setup Go"
+      # yamllint disable-line rule:line-length
+      uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+      with:
+        go-version: ${{ steps.validate.outputs.setup_go_version }}
+        go-version-file: ${{ steps.validate.outputs.setup_go_version_file }}
+        # Org security stance: no dependency/toolchain caching
+        cache: false
+
+    - name: "Prepare reports directory"
+      id: reports
+      shell: bash
+      env:
+        OUTPUT_DIRECTORY: ${{ inputs.output_directory }}
+      run: |
+        # Prepare reports directory
+        # Convert the output directory to an absolute path anchored
+        # to GITHUB_WORKSPACE. Resolution (realpath -m) happens BEFORE
+        # any mkdir, and the boundary check applies in ALL cases: the
+        # resolved path must sit within GITHUB_WORKSPACE or
+        # RUNNER_TEMP, as writing elsewhere on the runner filesystem
+        # is an operational/security risk
+        if [ -z "${OUTPUT_DIRECTORY}" ]; then
+          OUTPUT_DIRECTORY="."
+        fi
+        case "${OUTPUT_DIRECTORY}" in
+          /*) ;;
+          *) OUTPUT_DIRECTORY="${GITHUB_WORKSPACE:?}/${OUTPUT_DIRECTORY}" ;;
+        esac
+        # Each realpath call fails closed: an empty result would
+        # degrade the boundary case pattern to /* and disable the
+        # escape check
+        if ! REPORTS_DIR="$(realpath -m -- "${OUTPUT_DIRECTORY}")" ||
+          [ -z "${REPORTS_DIR}" ]; then
+          echo "Error: failed to resolve output directory ❌"
+          exit 1
+        fi
+        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE:?}")" ||
+          [ -z "${workspace}" ]; then
+          echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        if ! temp_dir="$(realpath -- "${RUNNER_TEMP:?}")" ||
+          [ -z "${temp_dir}" ]; then
+          echo "Error: failed to resolve RUNNER_TEMP ❌"
+          exit 1
+        fi
+        case "${REPORTS_DIR}/" in
+          "${workspace}/"*|"${temp_dir}/"*) ;;
+          *)
+            echo "Error: output directory outside permitted locations ❌"
+            echo "output_directory must resolve within"
+            echo "GITHUB_WORKSPACE or RUNNER_TEMP"
+            exit 1 ;;
+        esac
+        mkdir -p -- "${REPORTS_DIR}"
+        # Re-resolve after mkdir with symlinks followed (the path
+        # now exists) and re-check the boundary: the emitted
+        # reports_directory must name the physical directory the
+        # tool steps write to, not a symlink alias of it
+        if ! REPORTS_DIR="$(realpath -- "${REPORTS_DIR}")" ||
+          [ -z "${REPORTS_DIR}" ]; then
+          echo "Error: failed to resolve output directory ❌"
+          exit 1
+        fi
+        case "${REPORTS_DIR}/" in
+          "${workspace}/"*|"${temp_dir}/"*) ;;
+          *)
+            echo "Error: output directory outside permitted locations ❌"
+            echo "output_directory must resolve within"
+            echo "GITHUB_WORKSPACE or RUNNER_TEMP"
+            exit 1 ;;
+        esac
+        # The reports path derives from the caller-controlled
+        # output_directory and can legally contain characters unsafe
+        # for plain key=value output writes, so it uses the multiline
+        # heredoc output format with a random delimiter (built from
+        # shell-builtin randomness, regenerated until provably absent
+        # from the value) to prevent output-file injection
+        emit_output() {
+          key="$1"
+          value="$2"
+          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+        emit_output "reports_directory" "${REPORTS_DIR}"
+
+    - name: "Run govulncheck"
+      id: govulncheck
+      if: inputs.govulncheck == 'true'
+      shell: bash
+      env:
+        TOOL_VERSION: ${{ inputs.govulncheck_version }}
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        REPORTS_DIR: ${{ steps.reports.outputs.reports_directory }}
+      run: |
+        # Run govulncheck
+        # Anchor relative paths to GITHUB_WORKSPACE so behaviour stays
+        # deterministic when the caller sets a working directory. The
+        # :? expansions hard-fail on unset/empty runner variables,
+        # which would otherwise weaken the boundary checks below
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        # Re-resolve and enforce the boundaries at the point of use:
+        # the workspace is mutable between steps, so relying solely
+        # on the earlier validate step would leave a TOCTOU gap (a
+        # validated directory swapped for an escaping symlink)
+        # Each realpath call fails closed: an empty result would
+        # degrade the boundary case patterns to /* and disable the
+        # escape checks
+        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" ||
+          [ -z "${PROJECT_DIR}" ]; then
+          echo "Error: failed to resolve project directory ❌"
+          exit 1
+        fi
+        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE:?}")" ||
+          [ -z "${workspace}" ]; then
+          echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        if ! temp_dir="$(realpath -- "${RUNNER_TEMP:?}")" ||
+          [ -z "${temp_dir}" ]; then
+          echo "Error: failed to resolve RUNNER_TEMP ❌"
+          exit 1
+        fi
+        case "${PROJECT_DIR}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            exit 1 ;;
+        esac
+        if ! REPORTS_DIR="$(realpath -- "${REPORTS_DIR}")" ||
+          [ -z "${REPORTS_DIR}" ]; then
+          echo "Error: failed to resolve reports directory ❌"
+          exit 1
+        fi
+        case "${REPORTS_DIR}/" in
+          "${workspace}/"*|"${temp_dir}/"*) ;;
+          *)
+            echo "Error: reports directory escapes the boundary ❌"
+            exit 1 ;;
+        esac
+        # Install the pinned tool into a scratch directory removed on
+        # step exit: RUNNER_TEMP is not always cleaned between runs
+        # on self-hosted runners
+        tool_dir="$(mktemp -d "${RUNNER_TEMP}/go-audit.XXXXXX")"
+        trap 'rm -rf -- "${tool_dir}"' EXIT
+        echo "Installing govulncheck ${TOOL_VERSION}"
+        GOBIN="${tool_dir}" go install \
+          "golang.org/x/vuln/cmd/govulncheck@${TOOL_VERSION}"
+        if ! cd "${PROJECT_DIR}"; then
+          echo "Error: cannot change to project directory ❌"
+          exit 1
+        fi
+        # Text output for the console and report; exit code 3 means
+        # findings, other non-zero codes mean the scan itself broke
+        set +e
+        "${tool_dir}/govulncheck" ./... \
+          | tee "${REPORTS_DIR}/govulncheck.txt"
+        # $? would report tee (the last command in the pipeline);
+        # PIPESTATUS carries both exit codes: index 0 is the scanner
+        # (driving the findings/failure classification below) and
+        # index 1 is tee, whose failure means the report file is
+        # unreliable and fails the step outright
+        pipe_status=("${PIPESTATUS[@]}")
+        scan_exit="${pipe_status[0]}"
+        tee_exit="${pipe_status[1]}"
+        set -e
+        if [ "${tee_exit}" != "0" ]; then
+          echo "Error: failed writing the govulncheck report ❌"
+          exit 1
+        fi
+        case "${scan_exit}" in
+          0) passed="true" ;;
+          3) passed="false" ;;
+          *)
+            echo "Error: govulncheck failed (exit ${scan_exit}) ❌"
+            exit 1 ;;
+        esac
+        # In JSON mode govulncheck exits 0 even when it finds
+        # vulnerabilities, so a non-zero exit normally signals an
+        # operational failure; exit 3 (findings) is tolerated
+        # defensively in case a future release aligns JSON mode with
+        # the text-mode convention. govulncheck.json is part of the
+        # documented report set, so an operational failure here
+        # fails the step rather than silently dropping the
+        # machine-readable report
+        set +e
+        "${tool_dir}/govulncheck" -format json ./... \
+          > "${REPORTS_DIR}/govulncheck.json"
+        json_exit=$?
+        set -e
+        if [ "${json_exit}" != "0" ] && [ "${json_exit}" != "3" ]; then
+          echo "Error: govulncheck JSON report generation failed ❌"
+          exit 1
+        fi
+        echo "passed=${passed}" >> "$GITHUB_OUTPUT"
+        echo "govulncheck result: ${passed}"
+
+    - name: "Run gosec"
+      id: gosec
+      if: inputs.gosec == 'true'
+      shell: bash
+      env:
+        TOOL_VERSION: ${{ inputs.gosec_version }}
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        REPORTS_DIR: ${{ steps.reports.outputs.reports_directory }}
+      run: |
+        # Run gosec
+        # Anchor relative paths to GITHUB_WORKSPACE so behaviour stays
+        # deterministic when the caller sets a working directory. The
+        # :? expansions hard-fail on unset/empty runner variables,
+        # which would otherwise weaken the boundary checks below
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        # Re-resolve and enforce the boundaries at the point of use:
+        # the workspace is mutable between steps, so relying solely
+        # on the earlier validate step would leave a TOCTOU gap (a
+        # validated directory swapped for an escaping symlink)
+        # Each realpath call fails closed: an empty result would
+        # degrade the boundary case patterns to /* and disable the
+        # escape checks
+        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" ||
+          [ -z "${PROJECT_DIR}" ]; then
+          echo "Error: failed to resolve project directory ❌"
+          exit 1
+        fi
+        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE:?}")" ||
+          [ -z "${workspace}" ]; then
+          echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        if ! temp_dir="$(realpath -- "${RUNNER_TEMP:?}")" ||
+          [ -z "${temp_dir}" ]; then
+          echo "Error: failed to resolve RUNNER_TEMP ❌"
+          exit 1
+        fi
+        case "${PROJECT_DIR}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            exit 1 ;;
+        esac
+        if ! REPORTS_DIR="$(realpath -- "${REPORTS_DIR}")" ||
+          [ -z "${REPORTS_DIR}" ]; then
+          echo "Error: failed to resolve reports directory ❌"
+          exit 1
+        fi
+        case "${REPORTS_DIR}/" in
+          "${workspace}/"*|"${temp_dir}/"*) ;;
+          *)
+            echo "Error: reports directory escapes the boundary ❌"
+            exit 1 ;;
+        esac
+        # Install the pinned tool into a scratch directory removed on
+        # step exit: RUNNER_TEMP is not always cleaned between runs
+        # on self-hosted runners
+        tool_dir="$(mktemp -d "${RUNNER_TEMP}/go-audit.XXXXXX")"
+        trap 'rm -rf -- "${tool_dir}"' EXIT
+        echo "Installing gosec ${TOOL_VERSION}"
+        GOBIN="${tool_dir}" go install \
+          "github.com/securego/gosec/v2/cmd/gosec@${TOOL_VERSION}"
+        if ! cd "${PROJECT_DIR}"; then
+          echo "Error: cannot change to project directory ❌"
+          exit 1
+        fi
+        sarif_path="${REPORTS_DIR}/gosec.sarif"
+        # No pipeline here, so $? captures the gosec exit code
+        # directly
+        set +e
+        "${tool_dir}/gosec" -fmt sarif -out "${sarif_path}" ./...
+        scan_exit=$?
+        set -e
+        # gosec exits non-zero both for findings and for operational
+        # errors; a missing SARIF report distinguishes the latter
+        if [ ! -f "${sarif_path}" ]; then
+          echo "Error: gosec failed (exit ${scan_exit}) ❌"
+          echo "No SARIF report produced"
+          exit 1
+        fi
+        finding_count="$(jq \
+          '[.runs[].results // [] | length] | add // 0' \
+          "${sarif_path}")"
+        if [ "${scan_exit}" = "0" ]; then
+          passed="true"
+        else
+          passed="false"
+        fi
+        echo "passed=${passed}" >> "$GITHUB_OUTPUT"
+        echo "gosec result: ${passed} (${finding_count} findings)"
+
+    - name: "Run staticcheck"
+      id: staticcheck
+      if: inputs.staticcheck == 'true'
+      shell: bash
+      env:
+        TOOL_VERSION: ${{ inputs.staticcheck_version }}
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        REPORTS_DIR: ${{ steps.reports.outputs.reports_directory }}
+      run: |
+        # Run staticcheck
+        # Anchor relative paths to GITHUB_WORKSPACE so behaviour stays
+        # deterministic when the caller sets a working directory. The
+        # :? expansions hard-fail on unset/empty runner variables,
+        # which would otherwise weaken the boundary checks below
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        # Re-resolve and enforce the boundaries at the point of use:
+        # the workspace is mutable between steps, so relying solely
+        # on the earlier validate step would leave a TOCTOU gap (a
+        # validated directory swapped for an escaping symlink)
+        # Each realpath call fails closed: an empty result would
+        # degrade the boundary case patterns to /* and disable the
+        # escape checks
+        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" ||
+          [ -z "${PROJECT_DIR}" ]; then
+          echo "Error: failed to resolve project directory ❌"
+          exit 1
+        fi
+        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE:?}")" ||
+          [ -z "${workspace}" ]; then
+          echo "Error: failed to resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        if ! temp_dir="$(realpath -- "${RUNNER_TEMP:?}")" ||
+          [ -z "${temp_dir}" ]; then
+          echo "Error: failed to resolve RUNNER_TEMP ❌"
+          exit 1
+        fi
+        case "${PROJECT_DIR}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            exit 1 ;;
+        esac
+        if ! REPORTS_DIR="$(realpath -- "${REPORTS_DIR}")" ||
+          [ -z "${REPORTS_DIR}" ]; then
+          echo "Error: failed to resolve reports directory ❌"
+          exit 1
+        fi
+        case "${REPORTS_DIR}/" in
+          "${workspace}/"*|"${temp_dir}/"*) ;;
+          *)
+            echo "Error: reports directory escapes the boundary ❌"
+            exit 1 ;;
+        esac
+        # Install the pinned tool into a scratch directory removed on
+        # step exit: RUNNER_TEMP is not always cleaned between runs
+        # on self-hosted runners
+        tool_dir="$(mktemp -d "${RUNNER_TEMP}/go-audit.XXXXXX")"
+        trap 'rm -rf -- "${tool_dir}"' EXIT
+        echo "Installing staticcheck ${TOOL_VERSION}"
+        GOBIN="${tool_dir}" go install \
+          "honnef.co/go/tools/cmd/staticcheck@${TOOL_VERSION}"
+        if ! cd "${PROJECT_DIR}"; then
+          echo "Error: cannot change to project directory ❌"
+          exit 1
+        fi
+        # Exit code 1 means findings; other non-zero codes mean the
+        # analysis itself broke
+        set +e
+        "${tool_dir}/staticcheck" ./... \
+          | tee "${REPORTS_DIR}/staticcheck.txt"
+        # $? would report tee (the last command in the pipeline);
+        # PIPESTATUS carries both exit codes: index 0 is the scanner
+        # (driving the findings/failure classification below) and
+        # index 1 is tee, whose failure means the report file is
+        # unreliable and fails the step outright
+        pipe_status=("${PIPESTATUS[@]}")
+        scan_exit="${pipe_status[0]}"
+        tee_exit="${pipe_status[1]}"
+        set -e
+        if [ "${tee_exit}" != "0" ]; then
+          echo "Error: failed writing the staticcheck report ❌"
+          exit 1
+        fi
+        case "${scan_exit}" in
+          0) passed="true" ;;
+          1) passed="false" ;;
+          *)
+            echo "Error: staticcheck failed (exit ${scan_exit}) ❌"
+            exit 1 ;;
+        esac
+        echo "passed=${passed}" >> "$GITHUB_OUTPUT"
+        echo "staticcheck result: ${passed}"
+
+    - name: "Aggregate audit results"
+      id: aggregate
+      shell: bash
+      env:
+        GOVULNCHECK_STATUS: ${{ steps.govulncheck.outputs.passed }}
+        GOSEC_STATUS: ${{ steps.gosec.outputs.passed }}
+        STATICCHECK_STATUS: ${{ steps.staticcheck.outputs.passed }}
+        PERMIT_FAIL: ${{ inputs.permit_fail }}
+      run: |
+        # Aggregate audit results
+        # Normalise per-tool statuses: steps for disabled tools do
+        # not run, so their outputs arrive empty
+        normalise() {
+          case "$1" in
+            true|false) printf '%s' "$1" ;;
+            *) printf 'skipped' ;;
+          esac
+        }
+        govulncheck_passed="$(normalise "${GOVULNCHECK_STATUS}")"
+        gosec_passed="$(normalise "${GOSEC_STATUS}")"
+        staticcheck_passed="$(normalise "${STATICCHECK_STATUS}")"
         {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
+          echo "govulncheck_passed=${govulncheck_passed}"
+          echo "gosec_passed=${gosec_passed}"
+          echo "staticcheck_passed=${staticcheck_passed}"
         } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+        display() {
+          case "$1" in
+            true) printf 'passed ✅' ;;
+            false) printf 'failed ❌' ;;
+            *) printf 'skipped ⏭️' ;;
+          esac
+        }
+        {
+          echo "## 🛡️ Go Audit Results"
+          echo ""
+          echo "| Tool | Result |"
+          echo "| ---- | ------ |"
+          echo "| govulncheck | $(display "${govulncheck_passed}") |"
+          echo "| gosec | $(display "${gosec_passed}") |"
+          echo "| staticcheck | $(display "${staticcheck_passed}") |"
+        } >> "$GITHUB_STEP_SUMMARY"
+        failed=0
+        for status in "${govulncheck_passed}" "${gosec_passed}" \
+          "${staticcheck_passed}"; do
+          if [ "${status}" = "false" ]; then
+            failed=1
+          fi
+        done
+        if [ "${failed}" != "0" ]; then
+          if [ "${PERMIT_FAIL}" = "true" ]; then
+            echo "::warning::Audit tools reported findings;" \
+              "continuing (permit_fail: true)"
+            exit 0
+          fi
+          echo "::error::Audit tools reported findings ❌"
+          exit 1
+        fi
+        skipped=0
+        for status in "${govulncheck_passed}" "${gosec_passed}" \
+          "${staticcheck_passed}"; do
+          if [ "${status}" = "skipped" ]; then
+            skipped=$((skipped + 1))
+          fi
+        done
+        if [ "${skipped}" != "0" ]; then
+          echo "Audit complete: no findings from enabled tools" \
+            "(${skipped} skipped) ✅"
+        else
+          echo "Audit complete: no findings ✅"
+        fi
